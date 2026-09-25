@@ -56,7 +56,7 @@ The EROFS image and closure list are exposed as `passthru.image` and
 3. The output file is laid out in 4 KiB blocks:
 
    ```
-   [ sh stub ][ static bwrap ][ static erofsfuse ][ EROFS image ]
+   [ bash stub ][ static bwrap ][ static erofsfuse ][ EROFS image ]
    ```
 
    `bwrap` and `erofsfuse` come from `pkgsStatic` (musl), so they run on any
@@ -94,6 +94,9 @@ without root, even inside a user namespace.
     power over the host.
 - **The host's `/nix` is hidden inside the sandbox.** On a Nix or NixOS host,
   run the store path directly instead.
+- **The host needs `bash` (found via `/usr/bin/env`) and a POSIX `/bin/sh`.**
+  Both are present on any normal distribution; a busybox-only image may not
+  have bash.
 - **Each bundle is tied to one architecture.** The flake defines
   `x86_64-linux` and `aarch64-linux`.
 - **FUSE is slower than the in-kernel driver.** That matters only for

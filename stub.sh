@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # =============================================================================
 # self-hoisted-nix launcher stub
 # =============================================================================
@@ -17,13 +17,14 @@
 # not known when this file is written. erofs-bundle.nix fills them in with
 # nixpkgs' `substitute` helper, which replaces @name@-style placeholders. After
 # that the stub has no references to anything that needs to exist on the host
-# except a POSIX shell and a handful of standard tools (readlink, mkdir,
-# mktemp, dd, chmod, mv, rm).
+# except bash (found through /usr/bin/env, so it need not be in /bin), a POSIX
+# /bin/sh for the inner script, and a handful of standard tools (readlink,
+# mkdir, mktemp, dd, chmod, mv, rm).
 #
 # What happens when you run the bundle:
 #
-#   1. The kernel sees "#!/bin/sh" on the first line and runs the host's
-#      /bin/sh with the path of the bundle as the script to execute.
+#   1. The kernel sees "#!/usr/bin/env bash" on the first line and runs bash,
+#      with the path of the bundle as the script to execute.
 #   2. This script copies the two static helpers (bwrap, erofsfuse) out of
 #      its own file into a per-user cache directory, once.
 #   3. It uses bwrap to create a private sandbox (user + mount + PID
@@ -36,19 +37,21 @@
 #   6. When the program exits, the sandbox is torn down and the FUSE mount
 #      and its daemon disappear with it.
 #
-# Why the binary payload after this script is harmless: sh reads and runs a
-# script a little at a time, rather than parsing the whole file up front. The
-# last command below is `exec`, which replaces the shell process with bwrap,
-# so the shell never gets as far as the binary data. If `exec` itself fails
-# (for example the helper is missing), a non-interactive POSIX shell exits
-# right there, so the payload is never interpreted as shell code either way.
+# Why the binary payload after this script is harmless: bash reads a script in
+# chunks and parses one command at a time, rather than parsing the whole file
+# up front. The last command below is `exec`, which replaces the shell process
+# with bwrap, so the shell never gets as far as the binary data. If `exec`
+# itself fails (for example the helper is missing), a non-interactive shell
+# exits right there, so the payload is never interpreted as shell code either
+# way.
 # =============================================================================
 
 # -e: stop at the first command that fails, instead of carrying on in a broken
 #     state (for example running bwrap after extraction failed).
 # -u: treat use of an unset variable as an error, which catches typos and a
 #     missing $HOME early.
-set -eu
+# -o pipefail: a pipeline fails if any stage does, not just the last one.
+set -euo pipefail
 
 # -----------------------------------------------------------------------------
 # Layout constants (filled in at build time)
@@ -57,13 +60,15 @@ set -eu
 # Block size used for all padding and offsets. It must match `bs` in
 # erofs-bundle.nix. 4096 is also the EROFS block size and a typical page size,
 # so the image starts on a nicely aligned boundary.
-bs=4096
+readonly bs=4096
 
 # S = number of blocks taken up by this stub (including its NUL padding)
 # B = number of blocks taken up by the static bwrap binary
 # F = number of blocks taken up by the static erofsfuse binary
-# The EROFS image therefore starts at byte (S + B + F) * bs.
-S=@S@ B=@B@ F=@F@
+readonly S=@S@ B=@B@ F=@F@
+
+# Byte offset where the EROFS image starts inside the bundle.
+readonly image_offset=$(( (S + B + F) * bs ))
 
 # -----------------------------------------------------------------------------
 # Where are we?
@@ -101,7 +106,7 @@ cache=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/erofs-bundle/@id@
 #
 # We check for erofsfuse because the whole directory is moved into place in a
 # single rename (see below). If erofsfuse is there, bwrap is too.
-if [ ! -x "$cache/erofsfuse" ]; then
+if [[ ! -x $cache/erofsfuse ]]; then
   # Make sure the parent directory (.../erofs-bundle) exists. `${cache%/*}`
   # strips the last path component, i.e. the id.
   mkdir -p "${cache%/*}"
@@ -141,7 +146,7 @@ if [ ! -x "$cache/erofsfuse" ]; then
   # dir (that is what mv does when the target is an existing directory). That
   # leaves a harmless stray subdirectory; both runs still find correct
   # binaries at $cache/bwrap and $cache/erofsfuse.
-  [ -e "$cache" ] || mv "$tmp" "$cache"
+  [[ -e $cache ]] || mv "$tmp" "$cache"
 
   # If we lost the race above, our temp dir is still here; clean it up. If we
   # won, $tmp no longer exists and `rm -rf` quietly does nothing.
@@ -158,14 +163,19 @@ fi
 #   a. mounts the EROFS image onto /nix/store with erofsfuse, then
 #   b. replaces itself with the real program.
 #
-# It gets its inputs as positional parameters (see the bwrap command line
+# Why /bin/sh and not bash here: this script is plain POSIX and /bin/sh is the
+# one interpreter every host is guaranteed to have at a fixed path, which is
+# all bwrap can be given (there is no $PATH lookup for the sandbox command,
+# and /usr/bin/env may or may not be where bash is).
+#
+# It gets its inputs as positional parameters (see the bwrap argument list
 # further down). With `sh -c SCRIPT NAME ARG1 ARG2 ...`, NAME becomes $0 and
 # the ARGs become $1, $2, ... inside SCRIPT:
 #   $0  "sh"                     just a name for error messages
 #   $1  path to erofsfuse        in the cache dir, visible in the sandbox
 #   $2  byte offset of the image inside the bundle
 #   $3  absolute path of the program in /nix/store
-#   $4… the arguments the user passed to the bundle, untouched
+#   $4... the arguments the user passed to the bundle, untouched
 #
 # NOTE: this is a single-quoted string, so it must not contain a single quote
 # (apostrophe) anywhere, comments included. It is also not expanded here, only
@@ -212,21 +222,15 @@ exec "$main" "$@"
 '
 
 # -----------------------------------------------------------------------------
-# Step 3: build the bwrap command line
+# Step 3: build the bwrap argument list
 # -----------------------------------------------------------------------------
 #
-# POSIX sh has no arrays. The only list that keeps arguments containing
-# spaces safe is the positional parameter list, "$@". Right now "$@" holds the
-# user's arguments. We need to end up with:
+# Everything bwrap needs goes into one array. Quoting inside "${argv[@]}" is
+# per element, so paths with spaces or glob characters survive untouched, and
+# appending is just `argv+=( ... )`. The user's own arguments are not part of
+# it: they stay in "$@" and are appended at the very end of the final exec,
+# which is exactly where the inner script expects them.
 #
-#   [bwrap options ...] -- /bin/sh -c "$inner" sh <helper args> [user args ...]
-#
-# Trick: remember how many user arguments there are (n), APPEND everything
-# bwrap needs after them with `set -- "$@" ...`, and at the end "rotate" the
-# first n entries to the back. Everything stays properly quoted the whole
-# time.
-n=$#
-
 # Namespaces and basic mounts:
 #   --unshare-user     Create a new user namespace. We become the owner of
 #                      it, which is what lets an unprivileged user do the
@@ -255,9 +259,14 @@ n=$#
 #   --proc /proc       Mount a fresh procfs that matches the new PID namespace,
 #                      so /proc/self and friends describe the sandbox.
 #                      Mounting it is allowed because we own that namespace.
-set -- "$@" --unshare-user --unshare-pid --die-with-parent \
-  --cap-add CAP_SYS_ADMIN \
-  --dev-bind /dev /dev --proc /proc
+argv=(
+  --unshare-user
+  --unshare-pid
+  --die-with-parent
+  --cap-add CAP_SYS_ADMIN
+  --dev-bind /dev /dev
+  --proc /proc
+)
 
 # Rebuild the host root directory inside the sandbox.
 #
@@ -272,19 +281,21 @@ set -- "$@" --unshare-user --unshare-pid --die-with-parent \
 #   /dev   already bound above
 # Note: the glob /* does not match names starting with a dot. Nothing
 # important lives there.
+declare -A handled=([/nix]=1 [/proc]=1 [/dev]=1)
 for d in /*; do
-  case $d in /nix | /proc | /dev) continue ;; esac
-  if [ -L "$d" ]; then
+  if [[ -n ${handled[$d]:-} ]]; then
+    continue
+  elif [[ -L $d ]]; then
     # Top-level symlink, e.g. on merged-/usr distros /bin -> usr/bin and
     # /lib -> usr/lib. Recreate it as the same symlink (same target text) so
     # paths resolve exactly as on the host, including the dynamic loader
     # path. We rely on that below to run /bin/sh.
-    set -- "$@" --symlink "$(readlink "$d")" "$d"
-  elif [ -d "$d" ]; then
+    argv+=(--symlink "$(readlink "$d")" "$d")
+  elif [[ -d $d ]]; then
     # Real directory: bind-mount it at the same path, read-write like on the
     # host. bwrap binds recursively, so mounts below it (e.g. /home on its
     # own partition, /run/user/<uid>, /sys/fs/cgroup) come along too.
-    set -- "$@" --bind "$d" "$d"
+    argv+=(--bind "$d" "$d")
   fi
   # Anything else at the top level (e.g. a /swap.img file) is not needed by
   # programs and is skipped.
@@ -303,6 +314,8 @@ done
 #   --dir /nix/store
 #       Create the empty mount point for the image (and /nix above it) on the
 #       tmpfs root.
+argv+=(--ro-bind "$self" /.erofs-bundle --dir /nix/store)
+
 #   --
 #       End of bwrap options; everything after it is the command to run.
 #   /bin/sh -c "$inner" sh
@@ -312,35 +325,21 @@ done
 #   "$cache/erofsfuse"                 inner $1
 #       The cache is under $HOME (or $XDG_CACHE_HOME, or /tmp), all of
 #       which were bound above, so the same path works inside.
-#   $(((S + B + F) * bs))              inner $2
+#   "$image_offset"                    inner $2
 #       Byte offset where the EROFS image starts in the bundle.
 #   the program path (placeholder)     inner $3
 #       Filled in at build time from `exe` in erofs-bundle.nix. It is left
-#       unquoted on purpose so that it reads as one plain word: Nix store
-#       paths never contain spaces or glob characters.
-set -- "$@" --ro-bind "$self" /.erofs-bundle --dir /nix/store \
-  -- /bin/sh -c "$inner" sh \
-  "$cache/erofsfuse" $(((S + B + F) * bs)) @main@
-
-# The rotation from the start of step 3. "$@" is currently:
-#
-#   user1 .. userN  bwrap options ...  -- /bin/sh -c ... @main-path
-#
-# Each loop iteration copies the first argument to the end (set -- "$@" "$1")
-# and then drops it from the front (shift). After n iterations the user's
-# arguments are at the end, in their original order, right after the program
-# path, which is exactly where the inner script expects them.
-while [ "$n" -gt 0 ]; do
-  set -- "$@" "$1"
-  shift
-  n=$((n - 1))
-done
+#       unquoted on purpose: substitute inserts it already shell-quoted, so
+#       it becomes exactly one array element.
+argv+=(-- /bin/sh -c "$inner" sh "$cache/erofsfuse" "$image_offset" @main@)
 
 # -----------------------------------------------------------------------------
 # Step 4: go
 # -----------------------------------------------------------------------------
 #
-# Replace this shell with bwrap. From here on:
+# Replace this shell with bwrap, passing our argument list followed by the
+# user's own arguments ("$@", untouched since the script started). From here
+# on:
 #   bwrap (outer)   sets up the namespaces and mounts listed above, then
 #   bwrap (PID 1)   waits in the new PID namespace for its child,
 #   /bin/sh -c      the inner script mounts /nix/store and execs
@@ -350,4 +349,4 @@ done
 #
 # This is the last line the shell ever reads: the binary payload that
 # follows in the file is never parsed (see the header).
-exec "$cache/bwrap" "$@"
+exec "$cache/bwrap" "${argv[@]}" "$@"
