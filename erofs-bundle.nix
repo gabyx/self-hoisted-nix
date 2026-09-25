@@ -20,19 +20,25 @@
   pkgsStatic,
 }:
 
+let
+  defaultLauncher = pkgsStatic.callPackage ./launcher.nix { };
+in
 {
   drv,
   exe ? lib.getExe drv,
   name ? lib.getName drv,
+  # Any launcher that reads the trailer format: launcher.c (default), or
+  # the Go one in ./launcher-go (which needs mkfsFlags = [ ], see launcher-go/main.go).
+  launcher ? defaultLauncher,
+  # Extra mkfs.erofs flags, i.e. the compression.
+  mkfsFlags ? [ "-zlz4hc" ],
 }:
 
 let
-  launcher = pkgsStatic.callPackage ./launcher.nix { };
-
   closure = closureInfo { rootPaths = [ drv ]; };
 
   # Image root == contents of /nix/store, so it can be mounted directly there.
-  # Same recipe as nixpkgs' nixos/lib/erofs-store-image.nix, plus compression.
+  # Same recipe as nixpkgs' nixos/lib/erofs-store-image.nix, plus mkfsFlags.
   image =
     runCommand "${name}-closure.erofs"
       {
@@ -53,7 +59,7 @@ let
             --force-gid=0 \
             -T 0 \
             -U 00000000-0000-0000-0000-000000000000 \
-            -zlz4hc \
+            ${lib.escapeShellArgs mkfsFlags} \
             --hard-dereference \
             --tar=f \
             $out

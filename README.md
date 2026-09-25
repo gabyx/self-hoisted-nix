@@ -26,6 +26,8 @@ Bundles included as examples:
 | `.#python3`       | 23          | 209 MB  | 138 MB  |
 
 `.#launcher` is the bare launcher (about 2 MB) that every bundle starts with.
+`.#launcher-go`, `.#jq-go` and `.#python3-go` are the Go version; see
+[C launcher vs. Go launcher](#c-launcher-vs-go-launcher).
 
 Bundle your own package from another flake:
 
@@ -169,6 +171,82 @@ the one named in the trailer, and that program runs outside the filter. A
 test build that tries to run `/bin/sh` from the FUSE process shows
 `execve(...) +++ killed by SIGSYS +++`. A control build without the filter
 does run it.
+
+## C launcher vs. Go launcher
+
+`launcher-go/` is a pure-Go (no cgo) implementation of the same launcher,
+side by side with `launcher.c`. It reads the same bundle format and passes the
+same proofs (`allowedReferences = [ ]`, image-only references). It also mounts
+FUSE with plain system calls and puts the same seccomp exec ban on its FUSE
+server. It is built from `launcher-go/` by `go-launcher.nix`, and exposed as
+`.#launcher-go`, `.#jq-go` and `.#python3-go`. It uses:
+- [`hanwen/go-fuse`](https://github.com/hanwen/go-fuse) v2.11 for FUSE. It
+  supports the `/dev/fd/N` "already mounted" convention.
+- [`Xe/erofs`](https://github.com/Xe/erofs) v0.8.0 for reading EROFS.
+
+**Pure-Go EROFS readers can't read compressed images yet.** Tested against
+images from `mkfs.erofs` 1.9.4:
+- [`erofs/go-erofs`](https://github.com/erofs/go-erofs) v0.3.1 and
+  [`forkcloser/erofs`](https://github.com/forkcloser/erofs) v1.0.0 reject
+  compressed images outright.
+- `Xe/erofs` fails on every compressed file (`reading compact pcluster: EOF`),
+  with lz4, lz4hc, big pclusters and lzma alike, whether the image was built
+  from tar or from a directory.
+
+All three read uncompressed images exactly. So the Go bundles use an
+uncompressed image (`mkfsFlags = [ ]`).
+
+Measured on one x86_64 machine (Linux 6.5). Startup numbers are from
+`hyperfine`, 30 runs, warm caches:
+
+| | C (`launcher.c`) | Go (`launcher-go/`) |
+|---|---|---|
+| Launcher binary | 2.0 MB | 3.1 MB |
+| jq bundle | 22.1 MB (lz4hc) | 40.4 MB (uncompressed) |
+| python3 bundle | 131.7 MB (lz4hc) | 212.1 MB (uncompressed) |
+| `jq -n 1` | 14.5 ms | 26.2 ms |
+| python, 10 stdlib imports | 208 ms | 267 ms |
+| Read all 3,535 stdlib files (135 MiB) | 293 MiB/s | 191 MiB/s |
+| FUSE server memory (RSS) | 0.5 MB | 16 MB |
+| Processes started by the launcher | 3 (fork) | 4 (re-exec of itself) |
+| Code we maintain | 456 lines of C | 603 lines of Go |
+
+Both versions serve identical trees. Hashing every path, type, mode, file and
+symlink target under `/nix/store` inside the python3 bundles gives the same
+result as on the host (10,007 entries).
+
+**Where Go is harder:**
+- **No `fork()` without `exec()`.** Every process role is a re-exec of the
+  bundle itself.
+- **Capabilities have to be carried across exec.** They only survive as
+  ambient capabilities, and dropping them before the program needs an extra
+  EXEC helper process. Linux keeps capabilities per thread, and Go has
+  several threads.
+- **`Pdeathsig` is tied to an OS thread.** OUTER has to pin itself with
+  `runtime.LockOSThread`.
+- **No `siginfo`.** The C launcher tells Ctrl-C apart from `kill -INT` using
+  `si_code`, and Go's `os/signal` doesn't expose it. So `kill -INT <bundle>`
+  isn't forwarded, and a terminal hangup's `SIGHUP` may arrive twice.
+- **Dying of the program's signal needs raw syscalls.** Go's runtime owns the
+  handler for signals like SIGSEGV, so the launcher uses `rt_sigaction` and
+  `tgkill` directly.
+- **Seccomp needs `SECCOMP_FILTER_FLAG_TSYNC`** to cover threads that already
+  exist.
+- **nixpkgs' Go standard library has store paths baked in.** It hardcodes
+  `iana-etc` (instead of `/etc/protocols` and `/etc/services`), `tzdata` and
+  `mailcap`. The launcher needs a Go toolchain built without those patches,
+  compiled from source.
+- The bundles are 1.6–1.8× larger, because the image can't be compressed.
+
+**Where Go is easier:**
+- The FUSE server is memory-safe, written against a documented API. There's
+  no linker `--wrap` trick: `fs.Mount` returns once the mount is live.
+- INIT holds only `CAP_SYS_ADMIN` rather than every capability in the
+  namespace.
+- No C dependencies to rebuild statically (libfuse, erofs-utils, lz4, zstd, …).
+
+The C line count doesn't include erofsfuse, which erofs-utils provides. The Go
+count includes the ~150-line EROFS-to-FUSE adapter it had to write.
 
 ## Requirements and limitations
 

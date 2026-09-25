@@ -27,6 +27,20 @@
           launcher = pkgs.pkgsStatic.callPackage ./launcher.nix { };
           jq = mkErofsBundle { drv = pkgs.jq; };
           python3 = mkErofsBundle { drv = pkgs.python3; };
+
+          # The Go launcher, side by side. No pure-Go EROFS reader can read
+          # compressed images yet, so these use an uncompressed one.
+          launcher-go = pkgs.callPackage ./go-launcher.nix { };
+          jq-go = mkErofsBundle {
+            drv = pkgs.jq;
+            launcher = self.packages.${system}.launcher-go;
+            mkfsFlags = [ ];
+          };
+          python3-go = mkErofsBundle {
+            drv = pkgs.python3;
+            launcher = self.packages.${system}.launcher-go;
+            mkfsFlags = [ ];
+          };
         }
       );
     };
