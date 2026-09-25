@@ -70,8 +70,9 @@ import (
 // role removes them from its environment first thing, so the program never
 // sees them.
 const (
-	roleEnv = "SELF_HOISTED_NIX_ROLE"
-	cwdEnv  = "SELF_HOISTED_NIX_CWD"
+	roleEnv  = "SELF_HOISTED_NIX_ROLE"
+	cwdEnv   = "SELF_HOISTED_NIX_CWD"
+	argv0Env = "SELF_HOISTED_NIX_ARGV0" // the name the bundle was started as
 )
 
 func main() {
@@ -134,7 +135,7 @@ func runOuter() {
 	proc, err := os.StartProcess("/proc/self/exe",
 		append([]string{"self-hoisted-nix (init)"}, os.Args[1:]...),
 		&os.ProcAttr{
-			Env:   append(os.Environ(), roleEnv+"=init", cwdEnv+"="+cwd),
+			Env:   append(os.Environ(), roleEnv+"=init", cwdEnv+"="+cwd, argv0Env+"="+os.Args[0]),
 			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr, statusW},
 			Sys: &syscall.SysProcAttr{
 				// Same three namespaces as launcher.c. Go's

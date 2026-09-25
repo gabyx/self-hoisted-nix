@@ -838,10 +838,41 @@ static void run_fuse(const struct bundle *b, int self_fd, int ready_fd,
  * Step 5 (PROGRAM): become the real program
  * -------------------------------------------------------------------------- */
 
+/*
+ * Return the program to run for a bundle started as `argv0`: `exec`, or the
+ * program called basename(argv0) in the same directory as `exec`, if there
+ * is one (see run_program). `buf` holds the result in the second case.
+ *
+ * argv0 is chosen by whoever starts the bundle, so be strict: only a plain
+ * name (no "/" is possible after basename, and "." and ".." are refused),
+ * and only if that name is an executable regular file (after following
+ * symlinks, since nix-build -> nix is itself a symlink).
+ */
+static const char *pick_program(const char *exec, const char *argv0,
+				char *buf, size_t size)
+{
+	const char *name = strrchr(argv0, '/');
+	const char *exec_name = strrchr(exec, '/');
+	struct stat st;
+
+	name = name ? name + 1 : argv0;
+	if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..") ||
+	    !strcmp(name, exec_name + 1))
+		return exec;
+	if (snprintf(buf, size, "%.*s/%s", (int)(exec_name - exec), exec,
+		     name) >= (int)size)
+		return exec;
+	if (stat(buf, &st) < 0 || !S_ISREG(st.st_mode) || access(buf, X_OK) < 0)
+		return exec;
+	return buf;
+}
+
 /* Never returns. */
 static void run_program(const struct bundle *b, const char *cwd, int argc,
 			char **argv, const sigset_t *oldmask)
 {
+	char alt[PATH_MAX];
+	const char *path;
 	char **pargv;
 	int i;
 
@@ -874,13 +905,25 @@ static void run_program(const struct bundle *b, const char *cwd, int argc,
 		die_errno("cannot set no_new_privs");
 
 	/*
+	 * Which program to run: normally the trailer's "exec". But some
+	 * programs are "multi-call": one binary that behaves differently
+	 * depending on the name it was started under. Lix is one: nix-build,
+	 * nix-shell, nix-store, ... are all symlinks to `nix`, which looks at
+	 * the last component of argv[0]. So if the bundle itself was started
+	 * under another name (a symlink called nix-build pointing at the
+	 * bundle, say), and the closure has a program of that name right next
+	 * to "exec", run that one instead.
+	 */
+	path = pick_program(b->exec, argv[0], alt, sizeof(alt));
+
+	/*
 	 * Build argv for the program: argv[0] is its own path (what a shell
 	 * would pass), followed by all of the bundle's arguments unchanged.
 	 */
 	pargv = calloc((size_t)argc + 1, sizeof(char *));
 	if (!pargv)
 		die("out of memory");
-	pargv[0] = (char *)b->exec;
+	pargv[0] = (char *)path;
 	for (i = 1; i < argc; i++)
 		pargv[i] = argv[i];
 	pargv[argc] = NULL;
@@ -895,8 +938,8 @@ static void run_program(const struct bundle *b, const char *cwd, int argc,
 	 * with O_CLOEXEC, so the program does not inherit them. It gets only
 	 * stdin, stdout, stderr and whatever else the caller passed in.
 	 */
-	execve(b->exec, pargv, environ);
-	die_errno("cannot execute %s", b->exec);
+	execve(path, pargv, environ);
+	die_errno("cannot execute %s", path);
 }
 
 /* -----------------------------------------------------------------------------

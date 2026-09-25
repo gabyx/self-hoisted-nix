@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 
 	"golang.org/x/sys/unix"
@@ -24,7 +25,9 @@ func runExec() {
 	runtime.LockOSThread()
 
 	cwd := os.Getenv(cwdEnv)
+	argv0 := os.Getenv(argv0Env)
 	os.Unsetenv(cwdEnv)
+	os.Unsetenv(argv0Env)
 
 	self, err := os.Open("/proc/self/exe")
 	if err != nil {
@@ -59,7 +62,25 @@ func runExec() {
 	// argv[0] is the program's own path, then the bundle's arguments. The
 	// environment is the caller's, with our variables already removed.
 	// Signal handlers installed by the Go runtime are reset by execve().
-	argv := append([]string{b.exec}, os.Args[1:]...)
-	err = unix.Exec(b.exec, argv, os.Environ())
-	fail("cannot execute %s: %v", b.exec, err)
+	prog := pickProgram(b.exec, argv0)
+	argv := append([]string{prog}, os.Args[1:]...)
+	err = unix.Exec(prog, argv, os.Environ())
+	fail("cannot execute %s: %v", prog, err)
+}
+
+// pickProgram supports multi-call programs, exactly like pick_program() in
+// launcher.c: Lix's nix-build, nix-shell, ... are symlinks to `nix`, which
+// picks its mode from the name in argv[0]. If the bundle was started under a
+// name that is also an executable file next to `exec` (following symlinks),
+// run that instead. "." and ".." are refused; filepath.Base removes any "/".
+func pickProgram(exec, argv0 string) string {
+	name := filepath.Base(argv0)
+	if argv0 == "" || name == "." || name == ".." || name == "/" || name == filepath.Base(exec) {
+		return exec
+	}
+	alt := filepath.Join(filepath.Dir(exec), name)
+	if st, err := os.Stat(alt); err != nil || !st.Mode().IsRegular() || unix.Access(alt, unix.X_OK) != nil {
+		return exec
+	}
+	return alt
 }

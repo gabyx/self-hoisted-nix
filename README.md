@@ -23,7 +23,8 @@ Bundles included as examples:
 | Attribute         | Store paths | Closure | Bundle  |
 | ----------------- | ----------- | ------- | ------- |
 | `.#jq` (default)  | 7           | 37 MB   | 22 MB   |
-| `.#python3`       | 23          | 209 MB  | 138 MB  |
+| `.#python3`       | 23          | 209 MB  | 132 MB  |
+| `.#lix` (2.95.2)  | 68          | 293 MB  | 108 MB  |
 
 `.#launcher` is the bare launcher (about 2 MB) that every bundle starts with.
 `.#launcher-go`, `.#jq-go` and `.#python3-go` are the Go version; see
@@ -40,11 +41,51 @@ Bundle your own package from another flake:
       self-hoisted-nix.lib.x86_64-linux.mkErofsBundle {
         drv = nixpkgs.legacyPackages.x86_64-linux.ripgrep;
         # exe  ? lib.getExe drv   -- program to run
-        # name ? lib.getName drv  -- name of the output file
+        # name ? baseNameOf exe   -- name of the output file (see "Multi-call programs")
       };
   };
 }
 ```
+
+### Multi-call programs
+
+Some programs are one binary that behaves differently depending on the name
+it's started under. Lix is one: `nix-build`, `nix-shell`, `nix-store` and the
+rest are symlinks to `nix`. Both launchers support this: a bundle started under
+the name X runs the closure's `bin/X`, if there is one next to the program;
+otherwise it runs the program. So the bundle is named after its program by
+default, and symlinks give you the rest:
+
+```console
+$ nix build .#lix && cp result/bin/nix ~/bin/nix
+$ for n in nix-build nix-shell nix-store nix-instantiate; do ln -s nix ~/bin/$n; done
+$ nix-build --version
+nix-build (Lix, like Nix) 2.95.2
+```
+
+The name must be a plain file name that is an executable file in that
+directory; `.`, `..` and directories are ignored.
+
+### Lix
+
+`.#lix` is Lix 2.95.2 as a single file, and it works on a host without `/nix`.
+Inside the bundle `/nix/store` is the read-only image and there is no
+`/nix/var`, so Lix falls back to a *chroot store*. By default that's
+`~/.local/share/nix/root`, which Lix maps onto `/nix/store` itself when it
+builds or runs something. Evaluating, substituting and `nix run` work as they
+are. Building also needs `build-dir`, because Lix's default build directory is
+the fixed path `/nix/var/nix/b`:
+
+```console
+$ export NIX_CONFIG="build-dir = $HOME/.cache/nix-builds"   # store = … to move the store too
+$ nix-build -E 'derivation { name = "hi"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo hi > $out" ]; }'
+$ nix run nixpkgs#hello
+Hello, world!
+```
+
+Builds are sandboxed: Lix sets up its own build sandbox inside the bundle's.
+The host's Nix daemon, if any, isn't visible, because the sandbox hides the
+host's `/nix` entirely.
 
 The EROFS image, closure list, launcher and unproven bundle are exposed as
 `passthru.image`, `passthru.closure`, `passthru.launcher` and

@@ -26,7 +26,10 @@ in
 {
   drv,
   exe ? lib.getExe drv,
-  name ? lib.getName drv,
+  # The file name of the bundle. It defaults to the program's own name, because
+  # the launchers treat a bundle started as X like the closure's bin/X
+  # (multi-call support): Lix ships both bin/nix and bin/lix.
+  name ? builtins.unsafeDiscardStringContext (baseNameOf exe),
   # Any launcher that reads the trailer format: launcher.c (default), or
   # the Go one in ./launcher-go (which needs mkfsFlags = [ ], see launcher-go/main.go).
   launcher ? defaultLauncher,
