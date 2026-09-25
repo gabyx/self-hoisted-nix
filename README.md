@@ -1,5 +1,10 @@
 # self-hoisted-nix
 
+> [!WARNING]
+>
+> This is experimental/vibe-coded low-level funny stuff and nothing for the real world :)
+> Its done currently at NixCon 26.
+
 Turn any Nix-built program into a **single static executable** that runs on a
 Linux host without Nix: no `/nix`, no root, no setuid helper, not even
 `/bin/sh`.
