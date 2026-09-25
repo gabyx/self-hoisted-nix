@@ -67,20 +67,27 @@ runCommand "${name}-bundle"
     bs=4096
     blocks() { echo $(( ($(stat -c %s "$1") + bs - 1) / bs )); }
 
-    S=4
     B=$(blocks ${bwrap})
     F=$(blocks ${erofsfuse})
     id=$(echo ${bwrap} ${erofsfuse} | sha256sum | cut -c1-16)
 
-    substitute ${./stub.sh} stub \
-      --subst-var-by main ${lib.escapeShellArg exe} \
-      --subst-var-by id "$id" \
-      --subst-var-by S "$S" \
-      --subst-var-by B "$B" \
-      --subst-var-by F "$F"
+    mkstub() {
+      substitute ${./stub.sh} stub \
+        --subst-var-by main ${lib.escapeShellArg exe} \
+        --subst-var-by id "$id" \
+        --subst-var-by S "$1" \
+        --subst-var-by B "$B" \
+        --subst-var-by F "$F"
+    }
 
+    # The stub's block count S is written into the stub itself, so size it
+    # with a placeholder first. The extra digit or two only matters if the
+    # stub sits right at a block boundary, which the check below catches.
+    mkstub 0
+    S=$(blocks stub)
+    mkstub "$S"
     if [ "$(stat -c %s stub)" -gt $((S * bs)) ]; then
-      echo "stub.sh is larger than $S blocks; bump S" >&2
+      echo "stub grew past $S blocks after substituting S" >&2
       exit 1
     fi
 
