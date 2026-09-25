@@ -1,0 +1,3 @@
+# nix build outputs
+result
+result-*
