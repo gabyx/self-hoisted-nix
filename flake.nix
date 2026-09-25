@@ -24,6 +24,7 @@
         in
         {
           default = self.packages.${system}.jq;
+          launcher = pkgs.pkgsStatic.callPackage ./launcher.nix { };
           jq = mkErofsBundle { drv = pkgs.jq; };
           python3 = mkErofsBundle { drv = pkgs.python3; };
         }

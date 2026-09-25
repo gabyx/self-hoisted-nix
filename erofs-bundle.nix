@@ -1,14 +1,15 @@
 # Build a single executable file that carries a program's entire runtime
 # closure as an EROFS image and mounts it at /nix/store on demand.
 #
-# Output file layout, in 4 KiB blocks:
+# Output file layout:
 #
-#   [ sh stub ][ static bwrap ][ static erofsfuse ][ EROFS image ]
+#   [ static launcher, padded to 4 KiB ][ EROFS image ][ 4 KiB text trailer ]
 #
-# At run time the stub extracts the two static helpers to a cache dir, enters
-# an unprivileged user+mount+pid namespace (bwrap), FUSE-mounts the image
-# straight out of the file (erofsfuse --offset) at /nix/store, and execs the
-# program. Nothing on the host needs /nix, root, or a setuid helper.
+# The launcher (launcher.c) is generic and built once. It reads the trailer
+# at the end of its own file to find the image and the program, enters an
+# unprivileged user+mount+pid namespace, FUSE-mounts the image straight out
+# of the file at /nix/store with erofsfuse linked in, and execs the program.
+# Nothing on the host needs /nix, root, a shell, or a setuid helper.
 {
   lib,
   runCommand,
@@ -25,8 +26,7 @@
 }:
 
 let
-  bwrap = "${pkgsStatic.bubblewrap}/bin/bwrap";
-  erofsfuse = "${pkgsStatic.erofs-utils}/bin/erofsfuse";
+  launcher = pkgsStatic.callPackage ./launcher.nix { };
 
   closure = closureInfo { rootPaths = [ drv ]; };
 
@@ -60,42 +60,28 @@ let
 in
 runCommand "${name}-bundle"
   {
-    passthru = { inherit image closure; };
+    passthru = { inherit image closure launcher; };
     meta.mainProgram = name;
   }
   ''
     bs=4096
-    blocks() { echo $(( ($(stat -c %s "$1") + bs - 1) / bs )); }
 
-    B=$(blocks ${bwrap})
-    F=$(blocks ${erofsfuse})
-    id=$(echo ${bwrap} ${erofsfuse} | sha256sum | cut -c1-16)
+    # Launcher, padded so the image starts on a 4 KiB boundary (nice for a
+    # loop mount; erofsfuse itself would accept any offset).
+    install -m644 ${lib.getExe launcher} head
+    truncate -s $(( ($(stat -c %s head) + bs - 1) / bs * bs )) head
 
-    mkstub() {
-      substitute ${./stub.sh} stub \
-        --subst-var-by main ${lib.escapeShellArg exe} \
-        --subst-var-by id "$id" \
-        --subst-var-by S "$1" \
-        --subst-var-by B "$B" \
-        --subst-var-by F "$F"
-    }
-
-    # The stub's block count S is written into the stub itself, so size it
-    # with a placeholder first. The extra digit or two only matters if the
-    # stub sits right at a block boundary, which the check below catches.
-    mkstub 0
-    S=$(blocks stub)
-    mkstub "$S"
-    if [ "$(stat -c %s stub)" -gt $((S * bs)) ]; then
-      echo "stub grew past $S blocks after substituting S" >&2
+    # The trailer format is parsed by read_trailer() in launcher.c.
+    printf 'self-hoisted-nix v1\nimage-offset %s\nimage-size %s\nexec %s\n' \
+      "$(stat -c %s head)" "$(stat -c %s ${image})" ${lib.escapeShellArg exe} \
+      > trailer
+    if [ "$(stat -c %s trailer)" -gt $bs ]; then
+      echo "trailer longer than $bs bytes" >&2
       exit 1
     fi
-
-    install -m644 stub           p0 && truncate -s $((S * bs)) p0
-    install -m644 ${bwrap}       p1 && truncate -s $((B * bs)) p1
-    install -m644 ${erofsfuse}   p2 && truncate -s $((F * bs)) p2
+    truncate -s $bs trailer
 
     mkdir -p $out/bin
-    cat p0 p1 p2 ${image} > $out/bin/${name}
+    cat head ${image} trailer > $out/bin/${name}
     chmod 555 $out/bin/${name}
   ''
