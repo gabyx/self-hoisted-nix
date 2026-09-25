@@ -22,7 +22,7 @@ Bundles included as examples:
 
 | Attribute         | Store paths | Closure | Bundle  |
 | ----------------- | ----------- | ------- | ------- |
-| `.#jq` (default)  | 7           | 37 MB   | 23 MB   |
+| `.#jq` (default)  | 7           | 37 MB   | 22 MB   |
 | `.#python3`       | 23          | 209 MB  | 138 MB  |
 
 `.#launcher` is the bare launcher (about 2 MB) that every bundle starts with.
@@ -44,8 +44,9 @@ Bundle your own package from another flake:
 }
 ```
 
-The EROFS image, closure list and launcher are exposed as `passthru.image`,
-`passthru.closure` and `passthru.launcher`.
+The EROFS image, closure list, launcher and unproven bundle are exposed as
+`passthru.image`, `passthru.closure`, `passthru.launcher` and
+`passthru.unchecked`.
 
 ## How it works
 
@@ -115,6 +116,38 @@ error and exits with 127.
 
 The launcher uses FUSE because the in-kernel EROFS driver can't be mounted
 without root, even inside a user namespace.
+
+### Proof that nothing comes from the host's `/nix/store`
+
+Both checks run during `nix build`, and the build fails if either one fails.
+
+1. **The launcher references no store paths at all.** `launcher.nix` sets
+   `__structuredAttrs = true` and `outputChecks.out.allowedReferences = [ ]`,
+   so Nix itself rejects the build if the file mentions the hash of any path in
+   its build closure. The launcher is the only code that runs before
+   `/nix/store` is mounted, so it must not need anything from there.
+   Getting it to pass took two fixes, both explained in `launcher.nix`:
+   - nixpkgs' `fuse3` hardcodes util-linux's `mount`/`umount` by store path.
+   - `pkgsStatic` writes a `nix-support/propagated-build-inputs` file.
+2. **The bundle references only paths its own image serves.** A bundle can't
+   pass `allowedReferences = [ ]`: its image *is* store paths, so Nix finds
+   their hashes in it. The check is instead done in two steps:
+   - `passthru.unchecked` is built normally, so Nix computes its references.
+   - The final derivation reads that reference graph through
+     `exportReferencesGraph`, which is available because it uses
+     `__structuredAttrs`. It lists the top level of the EROFS image straight
+     out of the bundle file with `dump.erofs --offset`, and fails if anything
+     is referenced but not served.
+
+   For example, a bundle whose `exe` points outside `drv`'s closure fails with
+   `the bundle references store paths its image does not contain`. Once the
+   proof passes, the final output sets `unsafeDiscardReferences.out = true`,
+   so Nix records no store dependencies for it.
+
+```console
+$ nix path-info -rSh .#jq
+/nix/store/…-jq-bundle	  22.1M
+```
 
 ## Requirements and limitations
 

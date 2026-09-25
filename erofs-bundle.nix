@@ -16,6 +16,7 @@
   closureInfo,
   gnutar,
   erofs-utils,
+  jq,
   pkgsStatic,
 }:
 
@@ -57,13 +58,10 @@ let
             --tar=f \
             $out
       '';
-in
-runCommand "${name}-bundle"
-  {
-    passthru = { inherit image closure launcher; };
-    meta.mainProgram = name;
-  }
-  ''
+  # The bundle as Nix sees it without any help: Nix scans it and records a
+  # reference for every store path hash it finds. That reference list is the
+  # ground truth the proof below checks.
+  unchecked = runCommand "${name}-bundle-unchecked" { } ''
     bs=4096
 
     # Launcher, padded so the image starts on a 4 KiB boundary (nice for a
@@ -83,5 +81,60 @@ runCommand "${name}-bundle"
 
     mkdir -p $out/bin
     cat head ${image} trailer > $out/bin/${name}
+    chmod 555 $out/bin/${name}
+  '';
+in
+# The bundle can't pass `allowedReferences = [ ]` as it stands: its image
+# consists of store paths, so Nix finds their hashes in it. What must hold is
+# that every path it references is one it carries itself. This derivation
+# proves that from Nix's own reference graph of `unchecked`, then publishes
+# the same file with references discarded, so Nix no longer thinks the bundle
+# needs anything from a store.
+runCommand "${name}-bundle"
+  {
+    __structuredAttrs = true;
+    exportReferencesGraph.unchecked = [ unchecked ];
+    unsafeDiscardReferences.out = true;
+    nativeBuildInputs = [
+      jq
+      erofs-utils
+    ];
+    passthru = {
+      inherit
+        image
+        closure
+        launcher
+        unchecked
+        ;
+    };
+    meta.mainProgram = name;
+  }
+  ''
+    bundle=${unchecked}/bin/${name}
+
+    # 1. Every store path Nix found in the bundle (minus the bundle itself).
+    jq -r '.unchecked[].path' "$NIX_ATTRS_JSON_FILE" \
+      | grep -vxF ${unchecked} | sort -u > referenced
+
+    # 2. Every store path the bundle actually serves: the top-level entries
+    #    of the EROFS image, read out of the bundle file itself at the offset
+    #    its trailer names, i.e. exactly what the launcher mounts.
+    offset=$(tail -c 4096 "$bundle" | tr -d '\0' | sed -n 's/^image-offset //p')
+    dump.erofs --offset="$offset" --ls --path=/ "$bundle" \
+      | awk 'f && $3 != "." && $3 != ".." { print "${builtins.storeDir}/" $3 } /NID TYPE/ { f = 1 }' \
+      | sort -u > served
+
+    # 3. Referenced but not served is exactly the set of paths the bundle
+    #    would need from somewhere else. It must be empty.
+    comm -23 referenced served > missing
+    if [ -s missing ]; then
+      echo "error: the bundle references store paths its image does not contain:" >&2
+      cat missing >&2
+      exit 1
+    fi
+    echo "proof: all $(wc -l < referenced) store paths referenced by the bundle are served by its image ($(wc -l < served) paths)"
+
+    mkdir -p $out/bin
+    cp "$bundle" $out/bin/${name}
     chmod 555 $out/bin/${name}
   ''

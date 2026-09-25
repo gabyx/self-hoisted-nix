@@ -16,9 +16,18 @@
 }:
 
 let
+  # nixpkgs' preConfigure points libfuse's mount_util.c at util-linux's
+  # mount/umount by store path, which would make the launcher reference
+  # (and depend on) util-linux in /nix/store. Keep upstream's /bin/mount and
+  # /bin/umount instead. libfuse only runs them as real root, to update a
+  # non-symlinked /etc/mtab; that is never the case inside our sandbox.
+  # (The other substitution there only touches the mount.fuse3 program,
+  # which we do not link.)
+  fuse3-portable = fuse3.overrideAttrs { preConfigure = ""; };
+
   # --enable-static-fuse additionally installs liberofsfuse.a: erofsfuse's
   # main.c compiled with -Dmain=erofsfuse_main, plus all of liberofs.
-  erofsfuse-lib = erofs-utils.overrideAttrs (old: {
+  erofsfuse-lib = (erofs-utils.override { fuse3 = fuse3-portable; }).overrideAttrs (old: {
     configureFlags = old.configureFlags ++ [ "--enable-static-fuse" ];
   });
 in
@@ -29,10 +38,17 @@ stdenv.mkDerivation {
   src = ./launcher.c;
   dontUnpack = true;
 
+  # Proof that the launcher is self-contained: Nix fails the build if the
+  # output mentions ANY store path (it scans the file for the hash of every
+  # path in the build's input closure). The launcher runs before /nix/store
+  # is mounted, so it must not need anything from there.
+  __structuredAttrs = true;
+  outputChecks.out.allowedReferences = [ ];
+
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [
     erofsfuse-lib
-    fuse3
+    fuse3-portable
     lz4
     zstd
     xz
@@ -58,6 +74,14 @@ stdenv.mkDerivation {
     runHook preInstall
     install -Dm755 launcher $out/bin/self-hoisted-launcher
     runHook postInstall
+  '';
+
+  # pkgsStatic's stdenv records every buildInput in
+  # nix-support/propagated-build-inputs, so that static libraries pass their
+  # own dependencies on to whatever links them. Nothing links against the
+  # launcher, and that file would be its only store reference.
+  postFixup = ''
+    rm -r $out/nix-support
   '';
 
   meta.mainProgram = "self-hoisted-launcher";
