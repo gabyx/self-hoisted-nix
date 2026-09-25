@@ -91,11 +91,17 @@ processes take part:
    by bind-mounting each of the host's top-level directories, except `/nix`,
    and mounting a fresh `/proc`. Then it creates an empty `/nix/store` and
    makes the root read-only.
-3. **FUSE** runs `erofsfuse_main()`, which mounts the image straight out of the
-   bundle file (`--offset=<image-offset>`) onto `/nix/store`. The launcher is
-   linked with `-Wl,--wrap=fuse_daemonize`: libfuse calls that function right
-   after the mount succeeds, so the replacement tells INIT "ready" instead of
-   forking into the background.
+3. **FUSE** first mounts `/nix/store` with plain system calls:
+   `open("/dev/fuse")` and `mount(2)` with type `fuse.erofsfuse`, read-only.
+   Then it installs a seccomp filter that kills it if it ever calls `execve` or
+   `execveat`. Finally it runs `erofsfuse_main()` with the special mountpoint
+   `/dev/fd/N`, which tells libfuse the mount already exists. libfuse's own
+   mount code never runs, including its fallbacks to `fusermount3`,
+   `/bin/mount` and `/bin/umount`. erofsfuse then serves the image straight out
+   of the bundle file (`--offset=<image-offset>`). The launcher is linked with
+   `-Wl,--wrap=fuse_daemonize`: erofsfuse calls that function once it is ready
+   to serve, so the replacement tells INIT "ready" instead of forking into the
+   background.
 4. **PROGRAM** `exec`s the real program in the original working directory,
    with `no_new_privs` set and no capabilities.
 
@@ -117,9 +123,16 @@ error and exits with 127.
 The launcher uses FUSE because the in-kernel EROFS driver can't be mounted
 without root, even inside a user namespace.
 
-### Proof that nothing comes from the host's `/nix/store`
+### Proof that nothing comes from the host
 
-Both checks run during `nix build`, and the build fails if either one fails.
+The claim has three parts:
+
+1. The image contains only the closure.
+2. Nothing outside the image adds anything.
+3. Mounting runs no other program; it's just system calls.
+
+The first two are checked during `nix build`, and the build fails if either
+check fails:
 
 1. **The launcher references no store paths at all.** `launcher.nix` sets
    `__structuredAttrs = true` and `outputChecks.out.allowedReferences = [ ]`,
@@ -148,6 +161,14 @@ Both checks run during `nix build`, and the build fails if either one fails.
 $ nix path-info -rSh .#jq
 /nix/store/…-jq-bundle	  22.1M
 ```
+
+The third part is enforced by the kernel at run time. The FUSE server's
+seccomp filter kills it on `execve`/`execveat`, and it installs the filter
+before it starts any threads. So the only program the launcher ever starts is
+the one named in the trailer, and that program runs outside the filter. A
+test build that tries to run `/bin/sh` from the FUSE process shows
+`execve(...) +++ killed by SIGSYS +++`. A control build without the filter
+does run it.
 
 ## Requirements and limitations
 

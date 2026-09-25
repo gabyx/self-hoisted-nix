@@ -17,12 +17,12 @@
 
 let
   # nixpkgs' preConfigure points libfuse's mount_util.c at util-linux's
-  # mount/umount by store path, which would make the launcher reference
-  # (and depend on) util-linux in /nix/store. Keep upstream's /bin/mount and
-  # /bin/umount instead. libfuse only runs them as real root, to update a
-  # non-symlinked /etc/mtab; that is never the case inside our sandbox.
-  # (The other substitution there only touches the mount.fuse3 program,
-  # which we do not link.)
+  # mount/umount by store path. The launcher never runs that code: it mounts
+  # FUSE itself and forbids exec in the FUSE process (see mount_fuse() and
+  # forbid_exec() in launcher.c). But the code is still linked, and those
+  # dead strings would be store references. So keep upstream's /bin/mount
+  # and /bin/umount. (The other substitution there only touches the
+  # mount.fuse3 program, which we do not link.)
   fuse3-portable = fuse3.overrideAttrs { preConfigure = ""; };
 
   # --enable-static-fuse additionally installs liberofsfuse.a: erofsfuse's

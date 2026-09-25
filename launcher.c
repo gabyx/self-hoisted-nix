@@ -47,9 +47,11 @@
  *            directory. It then forks FUSE, waits until /nix/store is
  *            mounted, forks PROGRAM, and waits for PROGRAM to exit.
  *
- *   FUSE     Runs erofsfuse_main(), which mounts the EROFS image straight out
- *            of the bundle file (at image-offset) onto /nix/store and serves
- *            it until it is killed.
+ *   FUSE     Mounts a FUSE filesystem on /nix/store with plain system calls
+ *            (no mount helper programs), forbids itself from ever exec'ing
+ *            anything (seccomp), then runs erofsfuse_main(), which serves the
+ *            EROFS image straight out of the bundle file (at image-offset)
+ *            until it is killed.
  *
  *   PROGRAM  exec()s the real program. Every /nix/store/... path baked into
  *            it (ELF interpreter, shared libraries, data files) now resolves.
@@ -87,6 +89,11 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
 
 extern char **environ;
 
@@ -565,9 +572,11 @@ static int fuse_ready_fd = -1;
  * linker: every call to fuse_daemonize() in any object file (including the
  * ones inside liberofsfuse.a) should call __wrap_fuse_daemonize() instead.
  *
- * erofsfuse_main() calls fuse_daemonize() exactly once, right after the FUSE
- * mount has succeeded and just before it starts serving requests. That makes
- * it the perfect "the mount is ready" hook, without patching erofs-utils:
+ * erofsfuse_main() calls fuse_daemonize() exactly once: after it has opened
+ * the image, checked its superblock, and handed libfuse our already-mounted
+ * /dev/fuse descriptor, and just before it starts serving requests. That
+ * makes it the perfect "the mount is ready" hook, without patching
+ * erofs-utils:
  *
  *   1. Silence the FUSE process. erofsfuse prints a version banner and an
  *      "image mounted" notice on every start. Until now its stdout and stderr
@@ -597,6 +606,149 @@ int __wrap_fuse_daemonize(int foreground)
 }
 
 /*
+ * Mount an (empty, not yet served) FUSE filesystem on /nix/store ourselves,
+ * and return the /dev/fuse descriptor that carries its requests.
+ *
+ * Why not let libfuse do it? libfuse's mount code knows two fallbacks that
+ * run OTHER PROGRAMS: if mount(2) fails it runs the setuid helper
+ * `fusermount3`, and as real root it runs `/bin/mount` and `/bin/umount` to
+ * keep /etc/mtab up to date. Neither is part of the bundle, so on some host
+ * they could be missing or be anything at all. A FUSE mount needs nothing but
+ * two system calls, so we make them here, and give libfuse the result as the
+ * special mountpoint "/dev/fd/N". libfuse documents that form: "the parent
+ * process has already mounted; just use this descriptor". It then skips its
+ * mount code entirely, and also its unmount code (it never learns a mount
+ * point path to unmount).
+ *
+ * This is the same mount libfuse would have made: its own direct-mount path
+ * uses exactly these options.
+ */
+static int mount_fuse(void)
+{
+	char opts[128];
+	int fd;
+
+	/*
+	 * Every open() of /dev/fuse creates a new, unconnected FUSE channel.
+	 * The kernel will send this filesystem's requests (lookup, read, ...)
+	 * to this descriptor, and erofsfuse answers them through it.
+	 */
+	fd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		die_errno("cannot open /dev/fuse");
+
+	/*
+	 * Mount options understood by the kernel's FUSE driver:
+	 *   fd=N          the channel from above
+	 *   rootmode=...  file type of the root inode, in octal: 040000 is
+	 *                 S_IFDIR, a directory. Required.
+	 *   user_id=,     the owner of the mount: only processes running as this
+	 *   group_id=     user may access it (there is no allow_other). Required.
+	 *                 These are our ids as seen inside the user namespace.
+	 *
+	 * The source ("self-hoisted-nix") is just the name shown in
+	 * /proc/mounts. The type "fuse.erofsfuse" is how libfuse names it too:
+	 * "fuse." plus a subtype.
+	 *
+	 * Flags:
+	 *   MS_RDONLY   the image cannot change, so refuse writes up front
+	 *   MS_NOSUID   setuid bits in the image are ignored
+	 *   MS_NODEV    device nodes in the image do not work
+	 *
+	 * This is allowed without root because we hold CAP_SYS_ADMIN in our
+	 * user namespace, and FUSE is one of the filesystems the kernel lets a
+	 * user namespace mount.
+	 */
+	snprintf(opts, sizeof(opts), "fd=%d,rootmode=40000,user_id=%u,group_id=%u",
+		 fd, (unsigned)getuid(), (unsigned)getgid());
+	if (mount("self-hoisted-nix", "/nix/store", "fuse.erofsfuse",
+		  MS_RDONLY | MS_NOSUID | MS_NODEV, opts) < 0)
+		die_errno("cannot mount FUSE on /nix/store");
+
+	return fd;
+}
+
+/* The system call architecture this launcher is built for, for seccomp. */
+#if defined(__x86_64__)
+#define LAUNCHER_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define LAUNCHER_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#error "unsupported architecture: add its AUDIT_ARCH_* value here"
+#endif
+
+/* Kernel constant (asm/unistd.h) that musl's headers do not provide. */
+#if defined(__x86_64__) && !defined(__X32_SYSCALL_BIT)
+#define __X32_SYSCALL_BIT 0x40000000
+#endif
+
+/*
+ * Make it impossible for this process (and any thread or child it creates)
+ * to start another program.
+ *
+ * mount_fuse() means no code path we know of should run a program any more.
+ * This turns "should not" into "cannot": a seccomp filter is a small program
+ * the kernel runs on every system call this process makes. Ours kills the
+ * process if the call is execve() or execveat(), the only two ways to run a
+ * program on Linux (posix_spawn, system(), popen() and the exec*() family
+ * all end up in one of them). A violation shows up as the FUSE server dying,
+ * which INIT reports; it can never silently run something from the host.
+ *
+ * Filters are inherited across fork() and cannot be removed, and we install
+ * it before erofsfuse_main() starts any threads, so it covers all of them.
+ */
+static void forbid_exec(void)
+{
+	struct sock_filter filter[] = {
+		/*
+		 * Load the architecture of the system call. A process can make
+		 * system calls through another ABI (e.g. 32-bit x86 via int
+		 * 0x80), where the numbers mean different things. Anything but
+		 * our own architecture is killed.
+		 */
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+			 offsetof(struct seccomp_data, arch)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, LAUNCHER_AUDIT_ARCH, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
+		/* Load the system call number. */
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+			 offsetof(struct seccomp_data, nr)),
+#if defined(__x86_64__)
+		/*
+		 * x32 is a third ABI on x86_64 that shares the architecture
+		 * value but sets bit 30 in the number. Kill it too, or it would
+		 * be a way around the checks below.
+		 */
+		BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, __X32_SYSCALL_BIT, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+#endif
+		/* execve or execveat: kill. */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+
+		/* Everything else is allowed. */
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog prog = {
+		.len = sizeof(filter) / sizeof(filter[0]),
+		.filter = filter,
+	};
+
+	/*
+	 * The kernel requires no_new_privs (or CAP_SYS_ADMIN) before accepting
+	 * a filter, so that a filtered process cannot exec a setuid program
+	 * and confuse it. We will never exec anything, so it costs nothing.
+	 */
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+		die_errno("cannot set no_new_privs");
+	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0)
+		die_errno("cannot install the seccomp filter");
+}
+
+/*
  * Body of the FUSE process. Never returns.
  *
  *   self_fd   open file descriptor of the bundle file
@@ -607,8 +759,8 @@ int __wrap_fuse_daemonize(int foreground)
 static void run_fuse(const struct bundle *b, int self_fd, int ready_fd,
 		     int log_fd, const sigset_t *oldmask)
 {
-	char offset_arg[64], image_arg[64];
-	int null_fd;
+	char offset_arg[64], image_arg[64], fuse_arg[64];
+	int null_fd, fuse_fd;
 
 	/*
 	 * Move into a process group of our own. Keyboard signals (Ctrl-C,
@@ -639,6 +791,14 @@ static void run_fuse(const struct bundle *b, int self_fd, int ready_fd,
 	fuse_ready_fd = ready_fd;
 
 	/*
+	 * Mount first, then lock down. Any error message goes to the log pipe
+	 * and INIT shows it. Once mounted, programs that touch /nix/store just
+	 * wait until erofsfuse starts answering a moment later.
+	 */
+	fuse_fd = mount_fuse();
+	forbid_exec();
+
+	/*
 	 * The erofsfuse command line:
 	 *
 	 *   -f                  stay in the foreground. Our fuse_daemonize()
@@ -652,24 +812,24 @@ static void run_fuse(const struct bundle *b, int self_fd, int ready_fd,
 	 *                       exactly what is about to be covered up. Opening
 	 *                       /proc/self/fd/N reopens the same file no matter
 	 *                       where it lives.
-	 *   /nix/store          the mount point created by setup_root().
-	 *
-	 * How the mount works without root or fusermount: we hold CAP_SYS_ADMIN
-	 * in our user namespace, and the kernel allows FUSE to be mounted from a
-	 * user namespace. libfuse therefore calls mount(2) itself instead of
-	 * needing the setuid `fusermount3` helper.
+	 *   /dev/fd/N           instead of a mount point path: the /dev/fuse
+	 *                       descriptor of the mount we already made (see
+	 *                       mount_fuse), so libfuse mounts nothing itself.
 	 */
 	snprintf(offset_arg, sizeof(offset_arg), "--offset=%llu",
 		 (unsigned long long)b->image_offset);
 	snprintf(image_arg, sizeof(image_arg), "/proc/self/fd/%d", self_fd);
+	snprintf(fuse_arg, sizeof(fuse_arg), "/dev/fd/%d", fuse_fd);
 
-	char *argv[] = { "erofsfuse", "-f", offset_arg, image_arg,
-			 "/nix/store", NULL };
+	char *argv[] = { "erofsfuse", "-f", offset_arg, image_arg, fuse_arg,
+			 NULL };
 
 	/*
 	 * Only returns once the server stops (or failed to start). If it
-	 * failed before mounting, the ready pipe was never written and INIT
-	 * sees end-of-file on it when this process exits.
+	 * failed before serving, the ready pipe was never written and INIT sees
+	 * end-of-file on it when this process exits. Exiting also closes the
+	 * /dev/fuse descriptor, which disconnects the mount, so nothing waits
+	 * forever on a filesystem nobody is serving.
 	 */
 	_exit(erofsfuse_main(5, argv));
 }
