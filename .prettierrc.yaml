@@ -1,0 +1,20 @@
+---
+printWidth: 80
+tabWidth: 2
+semi: false
+singleQuote: false
+
+# TODO: Need to package prettier into devShell.
+# plugins:
+# - prettier-plugin-svelte
+# - prettier-plugin-tailwindcss
+
+overrides:
+  - files: "*.md"
+    options:
+      proseWrap: always
+      tabWidth: 2
+
+  # - files: "*.svelte"
+  #   options:
+  #     parser: svelte
