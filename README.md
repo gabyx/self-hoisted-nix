@@ -28,12 +28,14 @@ Even on a system with `nix` and a `/nix/store`, there are situations where you
 want a standalone executable that lives outside the `/nix/store`.
 
 One such use case is building **CI job container images** with
-`pkgs.dockerTools` and setting **`includeStorePaths = false;`**, which leaves
-all store paths **out** of the OCI image. The store paths must then be provided
-by a bind mount when the container starts. This is common on self-hosted CI
-runners, where a shared, read-only Nix store is bind-mounted into the job
-container at `/nix/store`. That store is either the host's own or one managed by
-a `nix daemon` running in a dedicated container.
+`pkgs.dockerTools`
+([see example here](https://github.com/gabyx/nixos-gitlab-runner/blob/main/src/nixos/gitlab/runner/podman-runner/job-images.nix#L197))
+and setting **`includeStorePaths = false;`**, which leaves all store paths
+**out** of the OCI image. The store paths must then be provided by a bind mount
+when the container starts. This is common on self-hosted CI runners, where a
+shared, read-only Nix store is bind-mounted into the job container at
+`/nix/store`. That store is either the host's own or one managed by a
+`nix daemon` running in a dedicated container.
 
 **This approach lets you pull essential executables out of the bind-mounted
 `/nix/store` and place them elsewhere in the job image. In a pure Nix CI, the
