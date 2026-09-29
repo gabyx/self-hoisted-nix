@@ -2,8 +2,8 @@
 
 > [!WARNING]
 >
-> This is experimental/vibe-coded low-level funny stuff and nothing for the real
-> world :) It was done currently at NixCon 26.
+> This is some experimental, mostly vibe-coded low-level funny stuff and nothing
+> for the real world :) It was done at NixCon 26 on the hacking days.
 
 Turn any Nix-built program into a **single static executable** that runs on a
 Linux host without Nix: no `/nix`, no root, no setuid helper, not even
