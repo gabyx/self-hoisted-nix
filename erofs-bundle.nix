@@ -21,7 +21,7 @@
 }:
 
 let
-  defaultLauncher = pkgsStatic.callPackage ./launcher.nix { };
+  defaultLauncher = pkgsStatic.callPackage ./launcher-c { };
 in
 {
   drv,

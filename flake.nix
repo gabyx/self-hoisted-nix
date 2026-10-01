@@ -1,7 +1,7 @@
 {
   description = "Pack a Nix closure into a single self-mounting EROFS executable";
 
-  inputs.nixpkgs.url = "nixpkgs";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
   outputs =
     { self, nixpkgs }:
@@ -12,9 +12,9 @@
       ];
     in
     {
-      lib = forAllSystems (
-        system: { mkErofsBundle = nixpkgs.legacyPackages.${system}.callPackage ./erofs-bundle.nix { }; }
-      );
+      lib = forAllSystems (system: {
+        mkErofsBundle = nixpkgs.legacyPackages.${system}.callPackage ./erofs-bundle.nix { };
+      });
 
       packages = forAllSystems (
         system:
@@ -24,7 +24,7 @@
         in
         {
           default = self.packages.${system}.jq;
-          launcher = pkgs.pkgsStatic.callPackage ./launcher.nix { };
+          launcher = pkgs.pkgsStatic.callPackage ./launcher-c { };
           jq = mkErofsBundle { drv = pkgs.jq; };
           python3 = mkErofsBundle {
             drv = pkgs.python3;
@@ -34,7 +34,7 @@
 
           # The Go launcher, side by side. No pure-Go EROFS reader can read
           # compressed images yet, so these use an uncompressed one.
-          launcher-go = pkgs.callPackage ./go-launcher.nix { };
+          launcher-go = pkgs.callPackage ./launcher-go { };
           jq-go = mkErofsBundle {
             drv = pkgs.jq;
             launcher = self.packages.${system}.launcher-go;

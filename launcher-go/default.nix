@@ -30,7 +30,7 @@ in
   pname = "self-hoisted-launcher-go";
   version = "1";
 
-  src = ./launcher-go;
+  src = ./.;
   vendorHash = "sha256-c4HY5auBo4NWmot/cudqR2XDnxzVe6weD4REYVZAlc4=";
 
   env.CGO_ENABLED = "0";
